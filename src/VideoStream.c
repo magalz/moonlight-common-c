@@ -3,6 +3,12 @@
 #define FIRST_FRAME_MAX 1500
 #define FIRST_FRAME_TIMEOUT_SEC 10
 
+// BOREALIS: LuminalShine can need up to about 18 s after the client attaches to send
+// the first complete frame, and sends a 1-byte runt datagram about 8 s in so the client
+// keeps waiting. This deadline ends the stream with ML_ERROR_NO_VIDEO_FRAME and is
+// measured from the first datagram, leaving margin for hosts slower than that.
+#define FIRST_FULL_FRAME_TIMEOUT_SEC 25
+
 #define FIRST_FRAME_PORT 47996
 
 static RTP_VIDEO_QUEUE rtpQueue;
@@ -19,6 +25,14 @@ static PLT_THREAD decoderThread;
 static bool receivedDataFromPeer;
 static uint64_t firstDataTimeMs;
 static bool receivedFullFrame;
+
+#ifndef LC_FUZZING
+// BOREALIS: Shared by both places that enforce the first full frame deadline.
+static bool firstFullFrameTimedOut(void) {
+    return receivedDataFromPeer && !receivedFullFrame &&
+           PltGetMillis() - firstDataTimeMs >= FIRST_FULL_FRAME_TIMEOUT_SEC * 1000;
+}
+#endif
 
 // We can't request an IDR frame until the depacketizer knows
 // that a packet was lost. This timeout bounds the time that
@@ -155,6 +169,17 @@ static void VideoReceiveThreadProc(void* context) {
                 }
             }
 
+#ifndef LC_FUZZING
+            // BOREALIS: The host can send a runt datagram and then stay silent while it
+            // rebuilds the display. Enforce the deadline here too, otherwise the stream
+            // would stay black forever because it was only checked when a datagram arrived.
+            if (firstFullFrameTimedOut()) {
+                Limelog("Terminating connection due to lack of a successful video frame\n");
+                ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
+                break;
+            }
+#endif
+
             // Receive timed out; try again
             continue;
         }
@@ -167,12 +192,11 @@ static void VideoReceiveThreadProc(void* context) {
         }
 
 #ifndef LC_FUZZING
-        if (!receivedFullFrame) {
-            if (PltGetMillis() - firstDataTimeMs >= FIRST_FRAME_TIMEOUT_SEC * 1000) {
-                Limelog("Terminating connection due to lack of a successful video frame\n");
-                ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
-                break;
-            }
+        // BOREALIS: Use the longer first full frame deadline instead of FIRST_FRAME_TIMEOUT_SEC.
+        if (firstFullFrameTimedOut()) {
+            Limelog("Terminating connection due to lack of a successful video frame\n");
+            ListenerCallbacks.connectionTerminated(ML_ERROR_NO_VIDEO_FRAME);
+            break;
         }
 #endif
 
